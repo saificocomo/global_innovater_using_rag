@@ -1,65 +1,132 @@
 # UK Innovator Founder Visa — RAG Assistant
 
-A small Retrieval-Augmented Generation (RAG) app that answers questions about the
-**UK Innovator Founder visa** using only the official GOV.UK guidance as its source.
+A retrieval-augmented generation (RAG) app that answers questions about the UK Innovator Founder visa using only the official gov.uk guidance, with inline source citations and a "don't know" guard against hallucination.
 
-It embeds the guidance locally with [`sentence-transformers`](https://www.sbert.net/),
-retrieves the most relevant chunks for a question, and asks an OpenAI chat model to
-answer **strictly from the retrieved context** — citing the source file and refusing
-to answer when the context doesn't cover it.
+Built from scratch (no LangChain) so every part of the pipeline — chunking, embedding, retrieval, generation — is explicit and easy to reason about. The project includes an **evaluation harness** that measures answer quality, and the README documents a measured before/after improvement from tuning retrieval.
 
-## How it works
+---
 
-1. **`ingest.py`** — reads the documents in `data/`, splits them into overlapping
-   chunks, embeds them with `all-MiniLM-L6-v2`, and saves the vectors to `index.pkl`.
-2. **`rag.py`** — embeds a question, retrieves the top matching chunks by cosine
-   similarity, and generates a grounded answer with `gpt-4o-mini`.
-3. **`evals.py`** — runs the questions in `golden.json` through the pipeline and uses
-   an LLM judge to score answers for correctness and faithfulness.
+## Results
+
+The app is evaluated against a hand-built "golden set" of 16 questions covering easy lookups, multi-part questions whose answers span multiple pages, paraphrased questions, and out-of-scope "trick" questions that should be refused.
+
+Two metrics are tracked:
+
+- **Correct** — does the answer match the known reference facts?
+- **Faithful** — does the answer stay grounded in the retrieved source, without inventing anything?
+
+| Change | Correct | Faithful |
+|---|---|---|
+| Baseline (retrieve top 4 chunks) | 81% (13/16) | 100% (16/16) |
+| Retrieve top 8 chunks | **94% (15/16)** | 100% (16/16) |
+
+### Failure analysis
+
+The baseline's three misses were not generation errors — the model answered correctly whenever it received the right text. They were **retrieval** problems:
+
+- **Facts split across pages.** "How many years to settle for the applicant vs. dependants?" needs two facts from different sections; with only 4 chunks retrieved, one of them fell outside the window.
+- **Topic ambiguity.** "Decision time inside the UK" collided with the more frequent "3 weeks" (outside-UK) phrasing repeated throughout the document.
+
+Increasing retrieval depth from 4 to 8 chunks resolved both, lifting correctness to 94% while keeping faithfulness at 100%.
+
+### Known limitation
+
+One question still fails: *"How much cash do I need to put into the business?"* This is a **semantic collision** — "cash into the business" (investment funds) is embedded very close to the personal-savings requirement (£1,270), so retrieval favours the savings passage. Increasing `k` did not fix it, which indicates the issue is at the embedding level rather than retrieval depth. Documented here rather than over-fitting the prompt to a single eval question. See *Future work*.
+
+---
+
+## Architecture
+
+The app uses **two different models for two different jobs**, which keeps it cheap and provider-agnostic:
+
+1. **Retrieval (local, free):** a `sentence-transformers` model (`all-MiniLM-L6-v2`) embeds text into vectors. Searching is done with cosine similarity in NumPy — no paid API, no external vector database.
+2. **Generation (hosted API):** an LLM reads the retrieved chunks and writes the final answer. Because only this step touches the API, swapping the provider (OpenAI ↔ Anthropic ↔ local) is a one-function change.
+
+```
+Question
+   │
+   ▼
+Embed question  ──►  Retrieve top-k chunks   (local: MiniLM + cosine similarity)
+                          │
+                          ▼
+                 Chunks + question  ──►  Generate grounded answer   (LLM API)
+                                              │
+                                              ▼
+                                        Answer + cited source
+```
+
+### How it works
+
+**Ingestion (`ingest.py`, run once):** extracts text from the source PDF, splits it into overlapping chunks, embeds each chunk into a vector, and saves everything to `index.pkl`. The slow work happens once, so querying is instant.
+
+**Query (`rag.py`):** embeds the user's question with the same model, ranks all chunks by cosine similarity, takes the top `k`, and passes them to the LLM with a system prompt that instructs it to answer **only** from the provided context, cite the source, and say "I don't know based on the official guidance" if the answer isn't present.
+
+**Evaluation (`evals.py`):** runs the real app against the golden set and uses an LLM-as-judge to score each answer for correctness and faithfulness, printing an overall percentage. This is what makes "did my change help?" an answerable question.
+
+---
 
 ## Setup
 
 ```bash
-# 1. Create and activate a virtual environment
+git clone <your-repo-url>
+cd <repo-folder>
+
 python -m venv venv
-source venv/bin/activate
+source venv/bin/activate          # Windows: venv\Scripts\activate
 
-# 2. Install dependencies
 pip install -r requirements.txt
-
-# 3. Add your OpenAI API key
-cp .env.example .env
-# then edit .env and paste your real key
 ```
+
+Add your API key in a `.env` file in the project root:
+
+```
+OPENAI_API_KEY=your-key-here
+```
+
+Place the source PDF(s) in the `data/` folder.
 
 ## Usage
 
 ```bash
-# Build the search index from the documents in data/
-python ingest.py
-
-# Ask questions interactively
-python rag.py
-
-# Run the evaluation suite
-python evals.py
+python ingest.py     # build the searchable index (run once)
+python rag.py        # ask questions interactively
+python evals.py      # measure quality against the golden set
 ```
+
+Example:
+
+```
+Question: How much does it cost to apply from outside the UK?
+It costs £1,357 per person if you apply outside the UK.
+Sources used: ['Innovator_Founder_visa - GOV.UK.pdf']
+```
+
+---
 
 ## Project structure
 
 ```
 .
-├── data/            # Source documents (official GOV.UK guidance)
-├── ingest.py        # Build the embedding index -> index.pkl
-├── rag.py           # Retrieve + answer
-├── evals.py         # LLM-as-judge evaluation
-├── golden.json      # Q&A reference set for evals
+├── data/             # source PDF(s)
+├── ingest.py         # PDF → chunks → embeddings → index.pkl
+├── rag.py            # retrieve + generate (interactive Q&A)
+├── evals.py          # quality measurement (LLM-as-judge)
+├── golden.json       # 16-question evaluation set with reference answers
 ├── requirements.txt
-└── .env.example     # Template for your OPENAI_API_KEY
+└── .env              # API key (gitignored, not committed)
 ```
+
+---
+
+## Future work
+
+- **Heading-based chunking** — split on the document's numbered section headings so each chunk is one coherent topic, which may resolve the investment-funds vs. personal-savings collision.
+- **Show retrieved snippets** in the `Sources used` output, not just filenames, for better transparency.
+- **Expand the golden set** to ~30 questions and add retrieval hit-rate as a separate metric.
+- **Simple web UI** and deployment.
+
+---
 
 ## Notes
 
-- `index.pkl` is a generated artifact and is git-ignored — run `python ingest.py` to
-  create it.
-- Your API key lives only in `.env`, which is git-ignored and never committed.
+Source content is UK government guidance, available under the Open Government Licence v3.0. This project is for demonstration and learning; it is not legal or immigration advice.
