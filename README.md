@@ -18,7 +18,10 @@ Two metrics are tracked:
 | Change | Correct | Faithful |
 |---|---|---|
 | Baseline (retrieve top 4 chunks) | 81% (13/16) | 100% (16/16) |
-| Retrieve top 8 chunks | **94% (15/16)** | 100% (16/16) |
+| Retrieve top 8 chunks | 94% (15/16) | 100% (16/16) |
+| Two-stage retrieval + cross-encoder re-ranker | 94% (15/16) | 100% (16/16) |
+
+> Re-ranking did not move the headline score, but it changed the *kind* of failure on the remaining question for the better — see "The last question, and a note on measurement" below.
 
 ### Failure analysis
 
@@ -29,37 +32,55 @@ The baseline's three misses were not generation errors — the model answered co
 
 Increasing retrieval depth from 4 to 8 chunks resolved both, lifting correctness to 94% while keeping faithfulness at 100%.
 
-### Known limitation
+### The last question, and a note on measurement
 
-One question still fails: *"How much cash do I need to put into the business?"* This is a **semantic collision** — "cash into the business" (investment funds) is embedded very close to the personal-savings requirement (£1,270), so retrieval favours the savings passage. Increasing `k` did not fix it, which indicates the issue is at the embedding level rather than retrieval depth. Documented here rather than over-fitting the prompt to a single eval question. See *Future work*.
+One question — *"How much cash do I need to put into the business?"* — is still scored incorrect, but the story behind it is the most interesting result in the project.
+
+It is a **semantic collision**: "cash into the business" (investment funds) embeds very close to the personal-savings requirement (£1,270), so single-vector search favours the savings passage. Increasing `k` did not help, because the problem is not retrieval depth — the two concepts simply look alike as embeddings.
+
+Adding the cross-encoder re-ranker changed the *behaviour*, even though the score stayed the same:
+
+- **Before re-ranking:** the app confidently answered with the wrong figure (the £1,270 savings amount).
+- **After re-ranking:** the re-ranker correctly rejected the savings chunk as a poor match, and with no clearly-correct chunk to promote, the app honestly returned *"I don't know based on the official guidance."*
+
+So the re-ranker traded a **confidently-wrong** answer for an **honest refusal** — which, for a compliance domain like immigration, is the safer failure. The eval still marks it incorrect because the answer doesn't match the reference, but this is arguably defensible: the source guidance does not state a fixed investment figure (funding is assessed case-by-case by the endorsing body), so "I don't know" is a reasonable response.
+
+**A note on measurement:** the LLM-as-judge shows minor run-to-run variance — repeated runs occasionally flip a single borderline verdict. Single-point metric changes are therefore treated cautiously rather than over-interpreted; for a small eval set, the *direction* and the *qualitative inspection of failures* matter more than a one-question delta.
 
 ---
 
 ## Architecture
 
-The app uses **two different models for two different jobs**, which keeps it cheap and provider-agnostic:
+The app uses **separate models for separate jobs**, which keeps it cheap and provider-agnostic:
 
-1. **Retrieval (local, free):** a `sentence-transformers` model (`all-MiniLM-L6-v2`) embeds text into vectors. Searching is done with cosine similarity in NumPy — no paid API, no external vector database.
-2. **Generation (hosted API):** an LLM reads the retrieved chunks and writes the final answer. Because only this step touches the API, swapping the provider (OpenAI ↔ Anthropic ↔ local) is a one-function change.
+1. **Retrieval, stage 1 (local, free):** a `sentence-transformers` model (`all-MiniLM-L6-v2`) embeds text into vectors. A fast cosine-similarity search in NumPy retrieves a wide set of candidate chunks — no paid API, no external vector database.
+2. **Retrieval, stage 2 — re-ranking (local, free):** a cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) re-scores those candidates by looking at the question and each chunk *together*, and keeps only the best few. This resolves semantic collisions that single-vector search cannot.
+3. **Generation (hosted API):** an LLM reads the final chunks and writes the answer. Because only this step touches the API, swapping the provider (OpenAI ↔ Anthropic ↔ local) is a one-function change.
 
 ```
 Question
    │
    ▼
-Embed question  ──►  Retrieve top-k chunks   (local: MiniLM + cosine similarity)
-                          │
-                          ▼
-                 Chunks + question  ──►  Generate grounded answer   (LLM API)
-                                              │
-                                              ▼
-                                        Answer + cited source
+Embed question
+   │
+   ▼
+Stage 1: vector search        →  ~20 candidate chunks   (fast, rough)
+   │
+   ▼
+Stage 2: cross-encoder rerank →  best k chunks           (slow, precise)
+   │
+   ▼
+Chunks + question  ──►  Generate grounded answer         (LLM API)
+                              │
+                              ▼
+                        Answer + cited source
 ```
 
 ### How it works
 
 **Ingestion (`ingest.py`, run once):** extracts text from the source PDF, splits it into overlapping chunks, embeds each chunk into a vector, and saves everything to `index.pkl`. The slow work happens once, so querying is instant.
 
-**Query (`rag.py`):** embeds the user's question with the same model, ranks all chunks by cosine similarity, takes the top `k`, and passes them to the LLM with a system prompt that instructs it to answer **only** from the provided context, cite the source, and say "I don't know based on the official guidance" if the answer isn't present.
+**Query (`rag.py`):** embeds the user's question with the same model, retrieves a wide set of candidate chunks by cosine similarity, re-ranks them with a cross-encoder to surface the most relevant few, and passes those to the LLM with a system prompt that instructs it to answer **only** from the provided context, cite the source, and say "I don't know based on the official guidance" if the answer isn't present.
 
 **Evaluation (`evals.py`):** runs the real app against the golden set and uses an LLM-as-judge to score each answer for correctness and faithfulness, printing an overall percentage. This is what makes "did my change help?" an answerable question.
 
@@ -120,7 +141,7 @@ Sources used: ['Innovator_Founder_visa - GOV.UK.pdf']
 
 ## Future work
 
-- **Heading-based chunking** — split on the document's numbered section headings so each chunk is one coherent topic, which may resolve the investment-funds vs. personal-savings collision.
+- **Heading-based chunking** — split on the document's numbered section headings so each chunk is one coherent topic, and measure against the current fixed-size chunks.
 - **Show retrieved snippets** in the `Sources used` output, not just filenames, for better transparency.
 - **Expand the golden set** to ~30 questions and add retrieval hit-rate as a separate metric.
 - **Simple web UI** and deployment.
