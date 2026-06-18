@@ -35,7 +35,7 @@ def main():
         correct += verdict["correct"]
         faithful += verdict["faithful"]
         mark = "✓" if verdict["correct"] else "✗"
-        p
+        
         
     n = len(golden)
     print(f"\nCorrect:  {correct}/{n} ({correct/n:.0%})")
